@@ -1,6 +1,7 @@
 import asyncio
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
+from typing import Any
 from uuid import UUID, uuid4
 
 from fastapi import Request
@@ -11,6 +12,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.sql import Select
 
 
 class Base(DeclarativeBase):
@@ -40,6 +42,32 @@ def build_engine(
 
 def build_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
     return async_sessionmaker(engine, expire_on_commit=False)
+
+
+async def committed_row_exists_after_error(
+    session: AsyncSession, statement: Select[tuple[Any]]
+) -> bool | None:
+    """Resolve an ambiguous commit outcome without allowing cancellation to abort it.
+
+    ``False`` is the only result that permits destructive external compensation.
+    ``None`` means the database outcome could not be established and callers must
+    preserve the object for reconciliation rather than risk deleting committed data.
+    """
+
+    async def inspect() -> bool | None:
+        try:
+            await session.rollback()
+            return (await session.scalar(statement)) is not None
+        except BaseException:
+            return None
+
+    task = asyncio.create_task(inspect())
+    while True:
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.done():
+                return task.result()
 
 
 async def get_session(request: Request) -> AsyncIterator[AsyncSession]:
